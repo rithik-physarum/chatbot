@@ -4,12 +4,14 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as cp from 'child_process';
 import * as os from 'os';
+import * as child_process from 'child_process';
 
 // Simple chat panel class
 class SimpleChatPanel {
   public static currentPanel: SimpleChatPanel | undefined;
   private readonly _panel: vscode.WebviewPanel;
   private _disposables: vscode.Disposable[] = [];
+  private _useManualCreationMode: boolean = false;
 
   private constructor(panel: vscode.WebviewPanel) {
     this._panel = panel;
@@ -53,10 +55,16 @@ class SimpleChatPanel {
           case 'sendMessage':
             // Check if we're in project creation mode
             if (message.createProject) {
-              await this._handleProjectCreation(message.text);
+              await this._handleProjectCreation(
+                message.text,
+                message.dataFiles
+              );
             } else {
               // Existing chat message handling code
+              const userMessage = message.text;
               const messageId = Date.now().toString();
+
+              // First add the thinking message
               this._panel.webview.postMessage({
                 command: 'receiveMessage',
                 text: 'Thinking...',
@@ -66,51 +74,114 @@ class SimpleChatPanel {
               });
 
               try {
-                // Build prompt with file contents if files are selected
-                let prompt = message.text;
-
+                // Add selected files to context if any
+                let prompt = userMessage;
                 if (message.files && message.files.length > 0) {
                   prompt = await this._buildPromptWithFiles(
-                    message.text,
+                    userMessage,
                     message.files
                   );
                 }
 
-                // Use streaming response from Gemini API
-                let fullResponse = '';
+                // Process any attached data files if provided
+                if (message.dataFiles && message.dataFiles.length > 0) {
+                  // Create a datasets directory in workspace if it doesn't exist
+                  const workspaceFolders = vscode.workspace.workspaceFolders;
+                  if (workspaceFolders && workspaceFolders.length > 0) {
+                    const targetDir = workspaceFolders[0].uri.fsPath;
+                    const datasetsDir = path.join(targetDir, 'datasets');
+                    await fs.promises
+                      .mkdir(datasetsDir, { recursive: true })
+                      .catch(() => {});
 
-                await getGeminiResponseSimulatedStream(
-                  prompt, // Send the enhanced prompt with file context
-                  (chunk) => {
-                    // Append each chunk from the API
-                    fullResponse += chunk;
+                    let filesInfo = '\n\nProcessing attached data files:';
 
-                    // Stream each chunk to the webview
+                    // Save each attached file
+                    for (const file of message.dataFiles) {
+                      try {
+                        // Extract base64 content
+                        let content = file.content.toString();
+                        const match = content.match(/^data:[^;]+;base64,(.*)$/);
+
+                        if (match) {
+                          content = Buffer.from(match[1], 'base64');
+
+                          // Save file to datasets directory
+                          const filePath = path.join(datasetsDir, file.name);
+                          await fs.promises.writeFile(filePath, content);
+
+                          filesInfo += `\n✓ Saved ${file.name} (${(
+                            file.size / 1024
+                          ).toFixed(2)} KB) to datasets directory.`;
+                        } else {
+                          filesInfo += `\n✗ Error processing ${file.name}: Invalid file format.`;
+                        }
+                      } catch (fileError: any) {
+                        console.error(
+                          `Error saving file ${file.name}:`,
+                          fileError
+                        );
+                        filesInfo += `\n✗ Error saving ${file.name}: ${
+                          fileError.message || 'Unknown error'
+                        }`;
+                      }
+                    }
+
+                    // Add information about saved files to the prompt
+                    prompt += `\n\nUser has uploaded the following data files to the datasets directory: ${message.dataFiles
+                      .map((f: any) => f.name)
+                      .join(
+                        ', '
+                      )}. Please analyze these files if necessary for the task.`;
+
+                    // Update the thinking message with file processing info
                     this._panel.webview.postMessage({
                       command: 'updateMessage',
-                      text: fullResponse,
+                      text: `Thinking...${filesInfo}`,
+                      messageId: messageId,
+                      isComplete: false,
+                    });
+                  }
+                }
+
+                // Get response from LLM
+                const self = this;
+                getGeminiResponseSimulatedStream(
+                  prompt,
+                  (partialResponse: string) => {
+                    // Update message with partial response
+                    self._panel.webview.postMessage({
+                      command: 'updateMessage',
+                      text: partialResponse,
                       messageId: messageId,
                       isComplete: false,
                     });
                   },
                   () => {
-                    // Complete the message when streaming ends
-                    this._panel.webview.postMessage({
+                    // Mark message as complete when stream ends
+                    self._panel.webview.postMessage({
                       command: 'updateMessage',
-                      text: fullResponse,
                       messageId: messageId,
                       isComplete: true,
                     });
                   }
-                );
-              } catch (error) {
-                // Handle API errors
+                ).catch((error: Error) => {
+                  console.error('Error getting response:', error);
+                  self._panel.webview.postMessage({
+                    command: 'updateMessage',
+                    text: `Error: ${error.message}`,
+                    messageId: messageId,
+                    isComplete: true,
+                    isError: true,
+                  });
+                });
+              } catch (error: any) {
+                console.error('Error handling message:', error);
                 this._panel.webview.postMessage({
-                  command: 'receiveMessage',
-                  text: `Error connecting to API: ${
-                    error instanceof Error ? error.message : 'Unknown error'
-                  }`,
-                  sender: 'bot',
+                  command: 'updateMessage',
+                  text: `Error processing message: ${error.message}`,
+                  messageId: messageId,
+                  isComplete: true,
                   isError: true,
                 });
               }
@@ -346,13 +417,59 @@ class SimpleChatPanel {
             .project-checkbox label {
                 cursor: pointer;
             }
+            /* File upload button styles */
+            .file-upload {
+                position: relative;
+                display: inline-block;
+                margin-right: 10px;
+            }
+            .file-upload input[type="file"] {
+                position: absolute;
+                left: 0;
+                top: 0;
+                opacity: 0;
+                width: 100%;
+                height: 100%;
+                cursor: pointer;
+            }
+            .file-upload-btn {
+                background: var(--vscode-button-background);
+                color: var(--vscode-button-foreground);
+                border: none;
+                padding: 8px 12px;
+                border-radius: 4px;
+                cursor: pointer;
+                display: inline-block;
+            }
+            .file-upload-btn:hover {
+                background: var(--vscode-button-hoverBackground);
+            }
+            .attached-files {
+                margin-top: 5px;
+                padding: 5px;
+                font-size: 0.9em;
+                color: var(--vscode-foreground);
+            }
+            .attached-file {
+                display: inline-block;
+                margin-right: 10px;
+                padding: 2px 5px;
+                background: var(--vscode-badge-background);
+                color: var(--vscode-badge-foreground);
+                border-radius: 4px;
+            }
+            .remove-attached {
+                margin-left: 5px;
+                cursor: pointer;
+                color: var(--vscode-editorError-foreground);
+            }
         </style>
     </head>
     <body>
         <div class="chat-container">
             <div id="chatHistory" class="chat-history">
                 <!-- Messages will appear here -->
-            </div>
+        </div>
             
             <!-- File selector dropdown -->
             <div class="file-selector">
@@ -377,14 +494,20 @@ class SimpleChatPanel {
             
             <!-- Chat input -->
             <div class="chat-input">
+                <div class="file-upload">
+                    <button class="file-upload-btn">📎</button>
+                    <input type="file" id="fileUpload" multiple accept=".csv,.xlsx,.json,.txt">
+                </div>
                 <input type="text" id="userInput" placeholder="Type your message...">
                 <button id="sendButton">Send</button>
             </div>
+            <div id="attachedFiles" class="attached-files" style="display: none;"></div>
         </div>
         
         <script>
             const vscode = acquireVsCodeApi();
             let selectedFiles = [];
+            let attachedDataFiles = []; // For storing attached data files
             
             // Initialize the UI
             document.addEventListener('DOMContentLoaded', () => {
@@ -419,6 +542,38 @@ class SimpleChatPanel {
                 }
             });
             
+            document.getElementById('fileUpload').addEventListener('change', (event) => {
+                const files = event.target.files;
+                if (files.length > 0) {
+                    // Clear the file input value to allow selecting the same file again
+                    const fileList = Array.from(files);
+                    
+                    // Create file reader and process each file
+                    fileList.forEach(file => {
+                        const reader = new FileReader();
+                        reader.onload = function(e) {
+                            // Convert file to base64
+                            const base64content = e.target.result;
+                            
+                            // Add to attachedDataFiles
+                            attachedDataFiles.push({
+                                name: file.name,
+                                type: file.type,
+                                size: file.size,
+                                content: base64content
+                            });
+                            
+                            // Update attached files display
+                            updateAttachedFilesDisplay();
+                        };
+                        reader.readAsDataURL(file);
+                    });
+                    
+                    // Reset the file input to allow selecting the same file again
+                    event.target.value = '';
+                }
+            });
+            
             function sendMessage() {
                 const input = document.getElementById('userInput');
                 const message = input.value.trim();
@@ -431,14 +586,23 @@ class SimpleChatPanel {
                         // Add files context if files are selected
                         let fileList = '';
                         selectedFiles.forEach(file => {
-                            fileList += \`- \${file.path}\\n\`;
+                            fileList += '- ' + file.path + '\n';
                         });
-                        displayMessage += '\\n\\n📄 Selected files:\\n' + fileList;
+                        displayMessage += '\n\n📄 Selected files:\n' + fileList;
+                    }
+                    
+                    // Add attached data files info if any
+                    if (attachedDataFiles.length > 0) {
+                        let dataFileList = '';
+                        attachedDataFiles.forEach(file => {
+                            dataFileList += '- ' + file.name + ' (' + (file.size / 1024).toFixed(2) + ' KB)\n';
+                        });
+                        displayMessage += '\n\n📊 Attached data files:\n' + dataFileList;
                     }
                     
                     // Add project creation indicator if checkbox is checked
                     if (isCreateProject) {
-                        displayMessage += '\\n\\n🏗️ Creating project using this prompt';
+                        displayMessage += '\n\n🏗️ Creating project using this prompt';
                     }
                     
                     addMessage(displayMessage, 'user');
@@ -448,11 +612,14 @@ class SimpleChatPanel {
                         command: 'sendMessage',
                         text: message,
                         files: selectedFiles.map(f => f.path),
-                        createProject: isCreateProject
+                        createProject: isCreateProject,
+                        dataFiles: attachedDataFiles
                     });
                     
-                    // Clear input
+                    // Clear input and attached files
                     input.value = '';
+                    attachedDataFiles = [];
+                    updateAttachedFilesDisplay();
                     
                     // If project creation, uncheck the box after sending
                     if (isCreateProject) {
@@ -496,7 +663,7 @@ class SimpleChatPanel {
                 } else {
                     // For user messages with selected files, show them separately
                     if (sender === 'user' && displayText.includes('📄 Selected files:')) {
-                        const parts = displayText.split('\\n\\n📄 Selected files:');
+                        const parts = displayText.split('\n\n📄 Selected files:');
                         const userText = parts[0];
                         const filesList = '📄 Selected files:' + parts[1];
                         
@@ -537,6 +704,33 @@ class SimpleChatPanel {
                     // Scroll to bottom
                     const chatHistory = document.getElementById('chatHistory');
                     chatHistory.scrollTop = chatHistory.scrollHeight;
+                }
+            }
+            
+            function updateAttachedFilesDisplay() {
+                const attachedFilesElement = document.getElementById('attachedFiles');
+                
+                if (attachedDataFiles.length > 0) {
+                    attachedFilesElement.style.display = 'block';
+                    attachedFilesElement.innerHTML = '';
+                    
+                    attachedDataFiles.forEach((file, index) => {
+                        const fileElement = document.createElement('span');
+                        fileElement.className = 'attached-file';
+                        fileElement.innerHTML = file.name + ' <span class="remove-attached" data-index="' + index + '">✕</span>';
+                        attachedFilesElement.appendChild(fileElement);
+                    });
+                    
+                    // Add event listeners for remove buttons
+                    document.querySelectorAll('.remove-attached').forEach(button => {
+                        button.addEventListener('click', function() {
+                            const index = parseInt(this.getAttribute('data-index'));
+                            attachedDataFiles.splice(index, 1);
+                            updateAttachedFilesDisplay();
+                        });
+                    });
+                } else {
+                    attachedFilesElement.style.display = 'none';
                 }
             }
             
@@ -635,16 +829,15 @@ class SimpleChatPanel {
                     
                     // Update dropdown button text
                     document.getElementById('fileDropdownBtn').textContent = 
-                        \`Selected Files (\${selectedFiles.length})\`;
+                        'Selected Files (' + selectedFiles.length + ')';
                     
                     // Add each selected file
                     selectedFiles.forEach((file, index) => {
                         const fileDiv = document.createElement('div');
                         fileDiv.className = 'selected-file';
-                        fileDiv.innerHTML = \`
-                            <span>📄 \${file.name || file.path}</span>
-                            <span class="remove-file" data-index="\${index}">✖</span>
-                        \`;
+                        fileDiv.innerHTML = 
+                            '<span>📄 ' + (file.name || file.path) + '</span>' +
+                            '<span class="remove-file" data-index="' + index + '">✖</span>';
                         container.appendChild(fileDiv);
                     });
                     
@@ -654,7 +847,7 @@ class SimpleChatPanel {
                             const index = parseInt(this.getAttribute('data-index'));
                             
                             // Update checkbox state
-                            const checkbox = document.querySelector(\`input[data-path="\${selectedFiles[index].path}"]\`);
+                            const checkbox = document.querySelector('input[data-path="' + selectedFiles[index].path + '"]');
                             if (checkbox) checkbox.checked = false;
                             
                             // Remove file from array
@@ -935,12 +1128,32 @@ class SimpleChatPanel {
     return result;
   }
 
-  private async _handleProjectCreation(prompt: string): Promise<void> {
+  private async _handleProjectCreation(
+    prompt: string,
+    dataFiles: any[] = []
+  ): Promise<void> {
     // Create a single message ID for the entire operation
     const messageId = Date.now().toString();
     let fullMessage = '';
+    let projectCreatedSuccessfully = false;
 
     try {
+      // First check if copier is installed
+      const copierInstalled = await this._ensureCopierInstalled();
+      if (!copierInstalled) {
+        fullMessage =
+          "Project creation requires the 'copier' Python package. Please install it and try again.";
+        this._panel.webview.postMessage({
+          command: 'receiveMessage',
+          text: fullMessage,
+          sender: 'bot',
+          isThinking: false,
+          messageId: messageId,
+          isComplete: true,
+        });
+        return;
+      }
+
       // Validate workspace
       const workspaceFolders = vscode.workspace.workspaceFolders;
       if (!workspaceFolders || workspaceFolders.length === 0) {
@@ -951,7 +1164,7 @@ class SimpleChatPanel {
       const targetDir = workspaceFolders[0].uri.fsPath;
 
       // Show initial message
-      fullMessage = `Creating project from GitHub template based on your prompt: "${prompt}"`;
+      fullMessage = `Creating ML project based on your prompt: "${prompt}"\n\nProcessing...`;
       this._panel.webview.postMessage({
         command: 'receiveMessage',
         text: fullMessage,
@@ -960,57 +1173,11 @@ class SimpleChatPanel {
         messageId: messageId,
       });
 
-      // Parse the prompt to extract GitHub repo
-      // We'll look for common patterns like "use repo: xyz" or "github.com/xyz"
-      let repoUrl = '';
+      // Extract template URL
+      const templateUrl = 'https://github.com/rithik-physarum/ml-template.git';
 
-      // Check for explicit repo mention
-      const repoMatches = prompt.match(
-        /(?:use\s+repo:?\s+|from\s+|github\.com\/|https:\/\/github\.com\/)([a-zA-Z0-9\-]+\/[a-zA-Z0-9\-_.]+)/i
-      );
-
-      if (repoMatches && repoMatches[1]) {
-        repoUrl = `https://github.com/${repoMatches[1].replace(
-          /^(https?:\/\/)?github\.com\//,
-          ''
-        )}`;
-      } else {
-        // Use the prompt as-is if it appears to be a GitHub URL
-        if (prompt.includes('github.com') || prompt.includes('/')) {
-          repoUrl = prompt.trim();
-          if (!repoUrl.startsWith('http')) {
-            repoUrl = `https://github.com/${repoUrl}`;
-          }
-        } else {
-          // If no explicit repo, ask the user
-          repoUrl =
-            (await vscode.window.showInputBox({
-              prompt: 'Enter GitHub repository URL or username/repo',
-              placeHolder:
-                'e.g., username/repository or https://github.com/username/repository',
-            })) || '';
-
-          if (!repoUrl) {
-            // Update message
-            fullMessage += '\n\nProject creation cancelled.';
-            this._panel.webview.postMessage({
-              command: 'updateMessage',
-              text: fullMessage,
-              messageId: messageId,
-              isComplete: true,
-            });
-            return;
-          }
-
-          // Ensure URL format
-          if (!repoUrl.startsWith('http')) {
-            repoUrl = `https://github.com/${repoUrl}`;
-          }
-        }
-      }
-
-      // Update user on progress
-      fullMessage += `\n\nFetching project template from ${repoUrl}...`;
+      // Update progress
+      fullMessage += `\n\nUsing template: ${templateUrl}`;
       this._panel.webview.postMessage({
         command: 'updateMessage',
         text: fullMessage,
@@ -1018,11 +1185,184 @@ class SimpleChatPanel {
         isComplete: false,
       });
 
-      // Create the project
-      await this._createProjectFromTemplate(repoUrl, targetDir);
+      // Gather copier template questions and prompt the user
+      const copierQuestions = await this._getCopierQuestions(templateUrl);
+      const userAnswers = await this._promptUserForCopierAnswers(
+        copierQuestions,
+        prompt
+      );
 
-      // Success message
-      fullMessage += `\n\nProject created successfully at ${targetDir}\nYou can now ask questions about the project files.`;
+      // Update progress
+      fullMessage +=
+        '\n\nGenerating project structure with your specifications...';
+      this._panel.webview.postMessage({
+        command: 'updateMessage',
+        text: fullMessage,
+        messageId: messageId,
+        isComplete: false,
+      });
+
+      try {
+        // Try to create project
+        await this._createProjectWithCopier(
+          templateUrl,
+          targetDir,
+          userAnswers
+        );
+        projectCreatedSuccessfully = true;
+      } catch (error) {
+        const errorMsg = String(error);
+
+        // If the error contains "python: command not found", it means the project structure
+        // was created but the post-update script failed
+        if (
+          errorMsg.includes('python: command not found') ||
+          errorMsg.includes(
+            "Command 'python post_update_script.py' returned non-zero exit status"
+          )
+        ) {
+          console.log(
+            'Project structure created but post-processing failed. This is expected on macOS.'
+          );
+          fullMessage +=
+            '\n\nProject structure created successfully. Running manual cleanup...';
+
+          this._panel.webview.postMessage({
+            command: 'updateMessage',
+            text: fullMessage,
+            messageId: messageId,
+            isComplete: false,
+          });
+
+          // Run post_update_script.py with python3 manually if it exists
+          const postUpdateScriptPath = path.join(
+            targetDir,
+            'post_update_script.py'
+          );
+          try {
+            if (
+              await fs.promises
+                .access(postUpdateScriptPath)
+                .then(() => true)
+                .catch(() => false)
+            ) {
+              await this._executeCommand('python3', ['post_update_script.py'], {
+                cwd: targetDir,
+                shell: true,
+              }).catch((e) =>
+                console.error('Manual script execution failed:', e)
+              );
+
+              // Clean up files that the script would have removed
+              await this._executeCommand(
+                'rm',
+                ['-f', '__version__.py', '__init__.py', 'pyproject.toml'],
+                { cwd: targetDir, shell: true }
+              ).catch((e) => console.error('Cleanup failed:', e));
+
+              await this._executeCommand(
+                'rm',
+                ['-rf', '.releaserc.yml', '.bumpversion.cfg'],
+                { cwd: targetDir, shell: true }
+              ).catch((e) => console.error('Cleanup failed:', e));
+
+              // Remove the script itself
+              await fs.promises.unlink(postUpdateScriptPath).catch(() => {});
+            }
+          } catch (scriptError) {
+            console.error('Manual cleanup had issues:', scriptError);
+          }
+
+          projectCreatedSuccessfully = true;
+        } else {
+          // For other errors, rethrow
+          throw error;
+        }
+      }
+
+      if (projectCreatedSuccessfully) {
+        // Remove unnecessary files
+        fullMessage +=
+          '\n\nCleaning up unnecessary files for your specific ML needs...';
+        this._panel.webview.postMessage({
+          command: 'updateMessage',
+          text: fullMessage,
+          messageId: messageId,
+          isComplete: false,
+        });
+
+        await this._removeUnnecessaryFiles(targetDir, prompt);
+
+        // Create a datasets directory if it doesn't exist
+        const datasetsDir = path.join(targetDir, 'datasets');
+        await fs.promises
+          .mkdir(datasetsDir, { recursive: true })
+          .catch(() => {});
+
+        // Save attached data files to the datasets directory
+        if (dataFiles && dataFiles.length > 0) {
+          fullMessage += '\n\nProcessing your attached data files...';
+          this._panel.webview.postMessage({
+            command: 'updateMessage',
+            text: fullMessage,
+            messageId: messageId,
+            isComplete: false,
+          });
+
+          for (const file of dataFiles) {
+            try {
+              // Extract base64 content - strip the data URL prefix
+              let content = file.content.toString();
+              const match = content.match(/^data:[^;]+;base64,(.*)$/);
+
+              if (match) {
+                content = Buffer.from(match[1], 'base64');
+
+                // Save file to datasets directory
+                const filePath = path.join(datasetsDir, file.name);
+                await fs.promises.writeFile(filePath, content);
+
+                fullMessage += `\nSaved ${file.name} to datasets directory.`;
+              } else {
+                fullMessage += `\nError processing ${file.name}: Invalid file format.`;
+              }
+            } catch (fileError: any) {
+              console.error(`Error saving file ${file.name}:`, fileError);
+              fullMessage += `\nError saving ${file.name}: ${
+                fileError.message || 'Unknown error'
+              }`;
+            }
+          }
+
+          this._panel.webview.postMessage({
+            command: 'updateMessage',
+            text: fullMessage,
+            messageId: messageId,
+            isComplete: false,
+          });
+        } else {
+          // If no files were attached, create a README for datasets directory
+          const readmePath = path.join(datasetsDir, 'README.md');
+          if (
+            !(await fs.promises
+              .access(readmePath)
+              .then(() => true)
+              .catch(() => false))
+          ) {
+            await fs.promises.writeFile(
+              readmePath,
+              '# Datasets Directory\n\nPlace your training and testing datasets in this directory.'
+            );
+          }
+
+          fullMessage +=
+            '\n\nNo data files were attached. Please upload your datasets to the datasets directory.';
+        }
+
+        // Success message
+        fullMessage += `\n\nML project created successfully at ${targetDir}\n\nYou can now upload your data and ask questions about building your model.`;
+      }
+
       this._panel.webview.postMessage({
         command: 'updateMessage',
         text: fullMessage,
@@ -1044,101 +1384,589 @@ class SimpleChatPanel {
     }
   }
 
-  private async _createProjectFromTemplate(
-    templateRepo: string,
-    targetFolder: string
-  ): Promise<boolean> {
-    try {
-      // Create temporary directory for the clone
-      const tempDir = path.join(os.tmpdir(), `vscode-template-${Date.now()}`);
-      await fs.promises.mkdir(tempDir, { recursive: true });
+  // Get questions from the copier template
+  private async _getCopierQuestions(templateUrl: string): Promise<any[]> {
+    // Instead of trying to extract questions from the template, let's define them explicitly
+    // based on the template's copier.yml
+    return [
+      {
+        name: 'author_name',
+        type: 'text',
+        help: 'Step 1/19 - "User\'s full name"',
+        required: true,
+      },
+      {
+        name: 'git_email',
+        type: 'text',
+        help: 'Step 2/19 - "User\'s email address"',
+        required: true,
+      },
+      {
+        name: 'user_uin',
+        type: 'text',
+        help: 'Step 3/19 - "User\'s BT UIN"',
+        default: 'N/A', // For generic use
+      },
+      {
+        name: 'user_team',
+        type: 'text',
+        help: 'Step 4/19 - "User\'s team"',
+        default: 'ML Team', // For generic use
+      },
+      {
+        name: 'gitlab_remote_location',
+        type: 'text',
+        help: 'Step 5/19 - "Parent Gitlab (remote) project location"',
+        default: 'N/A', // For generic use
+      },
+      {
+        name: 'local_repo_location',
+        type: 'text',
+        default: '/home/jupyter',
+        help: 'Step 6/19 - "Local repo location"',
+      },
+      {
+        name: 'repo_name',
+        type: 'text',
+        help: 'Step 7/19 - "Repository name for the ML project"',
+        required: true,
+      },
+      {
+        name: 'experiment_name',
+        type: 'text',
+        help: 'Step 8/19 - "Experiment name"',
+        // Will be auto-computed based on repo_name
+      },
+      {
+        name: 'package_name',
+        type: 'text',
+        help: 'Step 9/19 - "Package name in snake_case"',
+        // Will be auto-computed based on repo_name
+      },
+      {
+        name: 'project_id',
+        type: 'text',
+        default: 'my-ml-project',
+        help: 'Step 10/19 - "Google Cloud project (if applicable)"',
+      },
+      {
+        name: 'service_account',
+        type: 'text',
+        default: 'N/A',
+        help: 'Step 11/19 - "Service account (if applicable)"',
+      },
+      {
+        name: 'region',
+        type: 'text',
+        default: 'ind-bglr',
+        help: 'Step 12/19 - "Project location"',
+      },
+      {
+        name: 'docker_repo',
+        type: 'text',
+        default: 'local',
+        help: 'Step 13/19 - "Docker registry"',
+      },
+      {
+        name: 'pip_artifactory',
+        type: 'text',
+        default: 'pypi',
+        help: 'Step 14/19 - "The pip artifactory"',
+      },
+      {
+        name: 'exp_bucket',
+        type: 'text',
+        default: 'data',
+        help: 'Step 15/19 - "Storage location for experiment data"',
+      },
+      {
+        name: 'prod_bucket',
+        type: 'text',
+        default: 'data',
+        help: 'Step 16/19 - "Storage location for production data"',
+      },
+      {
+        name: 'training',
+        type: 'boolean',
+        default: true,
+        help: 'Step 17/19 - "Include training pipeline in your repository"',
+      },
+      {
+        name: 'prediction',
+        type: 'boolean',
+        default: true,
+        help: 'Step 18/19 - "Include prediction pipeline in your repository"',
+      },
+      {
+        name: 'monitoring',
+        type: 'boolean',
+        default: false,
+        help: 'Step 19/19 - "Include model performance and drift monitoring"',
+      },
+    ];
+  }
 
-      // Method 1: Using git clone (requires git installed)
-      await this._executeCommand(
-        `git clone --depth 1 ${templateRepo} "${tempDir}"`
-      );
+  // Prompt user for answers to copier questions
+  private async _promptUserForCopierAnswers(
+    questions: any[],
+    userPrompt: string
+  ): Promise<Record<string, any>> {
+    const answers: Record<string, any> = {};
 
-      // Remove .git folder to disconnect from source repo
-      const gitFolder = path.join(tempDir, '.git');
-      if (fs.existsSync(gitFolder)) {
-        await this._removeDirectory(gitFolder);
+    // First, explicitly ask for name and email regardless of what we can infer
+    const authorName = await vscode.window.showInputBox({
+      prompt: 'Please enter your name for the ML project',
+      placeHolder: 'ML Developer',
+      ignoreFocusOut: true,
+    });
+
+    answers['author_name'] = authorName || 'ML Developer';
+
+    const emailId = await vscode.window.showInputBox({
+      prompt: 'Please enter your email address',
+      placeHolder: 'ml.developer@example.com',
+      ignoreFocusOut: true,
+    });
+
+    answers['git_email'] = emailId || 'ml.developer@example.com';
+
+    // Try to infer some answers from the user prompt
+    const projectNameMatch = userPrompt.match(
+      /(?:project|model)\s+(?:for|about|on|called|named)\s+["']?([a-zA-Z0-9_-]+)["']?/i
+    );
+
+    // Process each question (skip name and email since we already handled them)
+    for (const question of questions) {
+      // Skip name and email since we already asked for them
+      if (question.name === 'author_name' || question.name === 'git_email') {
+        continue;
       }
 
-      // Create project folder (use repo name as folder name)
-      const repoName =
-        templateRepo.split('/').pop()?.replace('.git', '') || 'new-project';
-      const projectFolder = path.join(targetFolder, repoName);
+      let answer;
 
-      // Ensure the project folder exists
-      await fs.promises.mkdir(projectFolder, { recursive: true });
+      // Auto-answer for repo_name if we can extract it from prompt
+      if (question.name === 'repo_name' && projectNameMatch) {
+        const repoName = projectNameMatch[1].toLowerCase().replace(/\s+/g, '-');
+        answer = repoName;
 
-      // Copy all files from temp directory to project folder
-      await this._copyFolder(tempDir, projectFolder);
+        // Also set derived fields
+        if (questions.find((q) => q.name === 'experiment_name')) {
+          answers['experiment_name'] = `ex-${repoName.replace(
+            /^(bt-|ee-)/,
+            ''
+          )}`;
+        }
+        if (questions.find((q) => q.name === 'package_name')) {
+          answers['package_name'] = repoName
+            .replace(/^(bt-|ee-)/, '')
+            .replace(/-/g, '_');
+        }
+      } else if (
+        question.name === 'experiment_name' &&
+        answers['experiment_name']
+      ) {
+        // Skip if already set based on repo_name
+        answer = answers['experiment_name'];
+      } else if (question.name === 'package_name' && answers['package_name']) {
+        // Skip if already set based on repo_name
+        answer = answers['package_name'];
+      } else {
+        // Determine what to show for the model type based on the prompt
+        const isHousePriceModel =
+          userPrompt.toLowerCase().includes('house price') ||
+          userPrompt.toLowerCase().includes('housing price');
 
-      // Clean up temporary directory
-      await this._removeDirectory(tempDir);
+        // Set defaults based on the prompt
+        if (question.name === 'repo_name' && !answer) {
+          answer = isHousePriceModel ? 'house-price-prediction' : 'ml-project';
+        } else if (question.name === 'experiment_name' && !answer) {
+          const repo = isHousePriceModel
+            ? 'house-price-prediction'
+            : 'ml-project';
+          answer = `ex-${repo}`;
+        } else if (question.name === 'package_name' && !answer) {
+          const repo = isHousePriceModel
+            ? 'house-price-prediction'
+            : 'ml-project';
+          answer = repo.replace(/-/g, '_');
+        } else {
+          // Use default if available
+          if (question.default !== undefined) {
+            answer = question.default;
+          } else {
+            // Ask user via input box for required fields
+            answer = await vscode.window.showInputBox({
+              prompt: question.help || question.name,
+              placeHolder: question.default,
+              value: question.default,
+              ignoreFocusOut: true,
+            });
 
-      return true;
-    } catch (error) {
-      console.error('Error creating project from template:', error);
-      throw error;
+            // If user cancels a required field, use a sensible default
+            if (answer === undefined) {
+              if (question.name === 'repo_name') {
+                answer = isHousePriceModel
+                  ? 'house-price-prediction'
+                  : 'ml-project';
+              } else {
+                answer = question.default || '';
+              }
+            }
+          }
+        }
+      }
+
+      answers[question.name] = answer;
+    }
+
+    // For boolean questions, ensure they are boolean
+    for (const question of questions) {
+      if (
+        question.type === 'boolean' &&
+        typeof answers[question.name] !== 'boolean'
+      ) {
+        answers[question.name] =
+          String(answers[question.name]).toLowerCase() === 'true';
+      }
+    }
+
+    // Handle prediction sub-options
+    if (answers['prediction'] === true) {
+      answers['prediction_batch'] = true;
+      answers['prediction_vertex'] = false;
+      answers['prediction_cloudrun'] = false;
+      answers['prediction_aws'] = false;
+    }
+
+    return answers;
+  }
+
+  // Create project using copier
+  private async _createProjectWithCopier(
+    templateUrl: string,
+    targetDir: string,
+    answers: Record<string, any>
+  ): Promise<void> {
+    // Create the answers file in the target directory (not in temp)
+    const answersFileName = `copier-answers-${Date.now()}.json`;
+    const answersFilePath = path.join(targetDir, answersFileName);
+
+    await fs.promises.writeFile(
+      answersFilePath,
+      JSON.stringify(answers, null, 2)
+    );
+
+    try {
+      // Use a relative path for the answers file and add the --trust flag
+      await this._executeCommand(
+        'python3',
+        [
+          '-m',
+          'copier',
+          'copy',
+          '--answers-file',
+          answersFileName,
+          '--trust',
+          templateUrl,
+          '.',
+          '-f',
+        ],
+        { cwd: targetDir, shell: true }
+      );
+
+      // Let the main method handle any errors or post-processing
+    } finally {
+      // Clean up the answers file
+      try {
+        await fs.promises.unlink(answersFilePath);
+      } catch (error) {
+        console.error('Error removing temporary answers file:', error);
+      }
     }
   }
 
-  // Helper method to execute shell commands
-  private _executeCommand(command: string): Promise<string> {
-    return new Promise((resolve, reject) => {
-      cp.exec(command, (error, stdout, stderr) => {
-        if (error) {
-          reject(new Error(`Command failed: ${error.message}\n${stderr}`));
-          return;
+  // Remove unnecessary files based on user prompt
+  private async _removeUnnecessaryFiles(
+    targetDir: string,
+    userPrompt: string
+  ): Promise<void> {
+    // Create a list of directories and files to keep
+    const keepDirectories = [
+      'core/training',
+      'core/prediction',
+      'core/house-price-prediction',
+      'notebooks',
+    ];
+
+    // Remove all directories except those in keepDirectories
+    try {
+      // First, check if the core directory exists
+      const coreDir = path.join(targetDir, 'core');
+      if (await this._pathExists(coreDir)) {
+        // List all items in the core directory
+        const items = await fs.promises.readdir(coreDir);
+        for (const item of items) {
+          // Skip if this is one of our keep directories
+          if (
+            ['training', 'prediction', 'house-price-prediction'].includes(item)
+          ) {
+            continue;
+          }
+
+          const itemPath = path.join(coreDir, item);
+          const stat = await fs.promises.stat(itemPath);
+          if (stat.isDirectory()) {
+            await this._removeDirectory(itemPath);
+            console.log(`Removed directory: ${itemPath}`);
+          }
         }
-        resolve(stdout.trim());
+      }
+
+      // Remove env directory if it exists
+      const envDir = path.join(targetDir, 'env');
+      if (await this._pathExists(envDir)) {
+        await this._removeDirectory(envDir);
+        console.log('Removed env directory');
+      }
+
+      // Keep only exp environment directory
+      const envsDir = path.join(targetDir, 'envs');
+      if (await this._pathExists(envsDir)) {
+        const envItems = await fs.promises.readdir(envsDir);
+        for (const item of envItems) {
+          if (item !== 'exp') {
+            const itemPath = path.join(envsDir, item);
+            const stat = await fs.promises.stat(itemPath);
+            if (stat.isDirectory()) {
+              await this._removeDirectory(itemPath);
+              console.log(`Removed environment directory: ${itemPath}`);
+            }
+          }
+        }
+      }
+
+      // Remove common files we don't need
+      const filesToRemove = [
+        '.gitlab-ci.yml',
+        'common.gitlab-ci.yml.jinja',
+        '.gitlab-ci.yml.jinja',
+        'post_update_script.py.jinja',
+      ];
+
+      for (const file of filesToRemove) {
+        const filePath = path.join(targetDir, file);
+        if (await this._pathExists(filePath)) {
+          await fs.promises.unlink(filePath);
+        }
+      }
+    } catch (error) {
+      console.error('Error while cleaning up directories:', error);
+    }
+
+    // Create a datasets directory if it doesn't exist
+    const datasetsDir = path.join(targetDir, 'datasets');
+    await fs.promises.mkdir(datasetsDir, { recursive: true });
+
+    // Create README for datasets directory
+    await fs.promises.writeFile(
+      path.join(datasetsDir, 'README.md'),
+      '# Datasets Directory\n\nPlace your training and testing datasets in this directory.'
+    );
+  }
+
+  // Helper method to check if a path exists
+  private async _pathExists(path: string): Promise<boolean> {
+    return fs.promises
+      .access(path)
+      .then(() => true)
+      .catch(() => false);
+  }
+
+  // Helper functions
+  private async _executeCommand(
+    command: string,
+    args: string[],
+    options: any
+  ): Promise<{ stdout: string; stderr: string }> {
+    return new Promise((resolve, reject) => {
+      let stdout = '';
+      let stderr = '';
+
+      const childProcess = child_process.spawn(command, args, options);
+
+      childProcess.stdout.on('data', (data) => {
+        stdout += data.toString();
+      });
+
+      childProcess.stderr.on('data', (data) => {
+        stderr += data.toString();
+      });
+
+      childProcess.on('close', (code) => {
+        if (code === 0) {
+          resolve({ stdout, stderr });
+        } else {
+          reject(new Error(`Command failed with code ${code}: ${stderr}`));
+        }
+      });
+
+      childProcess.on('error', (error) => {
+        reject(error);
       });
     });
   }
 
-  // Helper method to recursively copy a folder
-  private async _copyFolder(source: string, target: string): Promise<void> {
-    // Create target folder if it doesn't exist
-    await fs.promises.mkdir(target, { recursive: true });
-
-    // Read source directory
-    const entries = await fs.promises.readdir(source, { withFileTypes: true });
-
-    for (const entry of entries) {
-      const sourcePath = path.join(source, entry.name);
-      const targetPath = path.join(target, entry.name);
-
-      if (entry.isDirectory()) {
-        // Recursive copy for directories
-        await this._copyFolder(sourcePath, targetPath);
+  private async _removeDirectory(directory: string): Promise<void> {
+    try {
+      // Use native fs.promises.rm (Node.js 14+)
+      await fs.promises.rm(directory, { recursive: true, force: true });
+    } catch (error) {
+      // Fallback for older Node.js versions
+      if (process.platform === 'win32') {
+        await this._executeCommand('rd', ['/s', '/q', directory], {
+          shell: true,
+        });
       } else {
-        // Copy file
-        await fs.promises.copyFile(sourcePath, targetPath);
+        await this._executeCommand('rm', ['-rf', directory], { shell: true });
       }
     }
   }
 
-  // Helper method to recursively remove a directory
-  private async _removeDirectory(dirPath: string): Promise<void> {
-    if (!fs.existsSync(dirPath)) {
-      return;
-    }
+  private async _findFilesContaining(
+    directory: string,
+    patterns: string[]
+  ): Promise<string[]> {
+    const results: string[] = [];
 
-    const entries = await fs.promises.readdir(dirPath, { withFileTypes: true });
+    // Helper function to recursively search the directory
+    const searchDirectory = async (dir: string, relativePath: string = '') => {
+      const entries = await fs.promises.readdir(dir, { withFileTypes: true });
 
-    for (const entry of entries) {
-      const fullPath = path.join(dirPath, entry.name);
+      for (const entry of entries) {
+        const entryRelativePath = path.join(relativePath, entry.name);
+        const fullPath = path.join(dir, entry.name);
 
-      if (entry.isDirectory()) {
-        await this._removeDirectory(fullPath);
-      } else {
-        await fs.promises.unlink(fullPath);
+        if (entry.isDirectory()) {
+          // Skip node_modules and .git directories
+          if (entry.name !== 'node_modules' && entry.name !== '.git') {
+            await searchDirectory(fullPath, entryRelativePath);
+          }
+        } else if (entry.isFile()) {
+          // Check if filename contains any of the patterns
+          const lowerCaseName = entry.name.toLowerCase();
+          if (
+            patterns.some((pattern) =>
+              lowerCaseName.includes(pattern.toLowerCase())
+            )
+          ) {
+            results.push(entryRelativePath);
+          }
+        }
+      }
+    };
+
+    await searchDirectory(directory);
+    return results;
+  }
+
+  private async _ensureCopierInstalled(): Promise<boolean> {
+    try {
+      // Check if copier is installed
+      await this._executeCommand('copier', ['--version'], { shell: true });
+      return true;
+    } catch (error) {
+      // Try with full path if available
+      try {
+        // On some systems, the PATH isn't updated in the current session
+        // Try common Python paths
+        const pythonPaths = [
+          path.join(os.homedir(), '.local', 'bin', 'copier'),
+          path.join(
+            os.homedir(),
+            'AppData',
+            'Local',
+            'Programs',
+            'Python',
+            'Python*',
+            'Scripts',
+            'copier.exe'
+          ),
+        ];
+
+        for (const possiblePath of pythonPaths) {
+          try {
+            // Use glob to find matches if path contains wildcards
+            const matches = require('glob').sync(possiblePath);
+            if (matches && matches.length > 0) {
+              await this._executeCommand(matches[0], ['--version'], {
+                shell: true,
+              });
+              return true;
+            }
+          } catch {
+            // Continue to next path
+          }
+        }
+
+        // If we get here, none of the paths worked
+        throw new Error('Copier not found in common locations');
+      } catch {
+        // Prompt user to install copier
+        const installAction = 'Install Copier';
+        const manualAction = 'Manual Creation';
+
+        const response = await vscode.window.showErrorMessage(
+          'The copier package is required for ML project creation. Would you like to install it or proceed with manual creation?',
+          installAction,
+          manualAction
+        );
+
+        if (response === installAction) {
+          try {
+            // Show installation process in terminal for visibility
+            const terminal = vscode.window.createTerminal(
+              'Copier Installation'
+            );
+            terminal.show();
+
+            if (process.platform === 'win32') {
+              terminal.sendText('pip install copier');
+            } else {
+              terminal.sendText('pip3 install copier --user');
+            }
+
+            // Give the user instructions
+            await vscode.window.showInformationMessage(
+              'Installing copier in terminal. Please press "Manual Creation" after the installation completes.'
+            );
+
+            return false;
+          } catch (installError) {
+            vscode.window.showErrorMessage(
+              `Failed to install copier: ${installError}`
+            );
+            return false;
+          }
+        } else if (response === manualAction) {
+          // Proceed with a simplified project creation that doesn't use copier
+          return this._useManualCreation();
+        }
+
+        return false;
       }
     }
+  }
 
-    await fs.promises.rmdir(dirPath);
+  // Add a fallback method for manual creation
+  private async _useManualCreation(): Promise<boolean> {
+    // Set a flag to use manual creation instead of copier
+    this._useManualCreationMode = true;
+
+    vscode.window.showInformationMessage(
+      'Proceeding with simplified project creation without copier.'
+    );
+
+    return true;
   }
 }
 
