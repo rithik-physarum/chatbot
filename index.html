@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Chat Interface</title>
+    <style>
+      body {
+        font-family: Arial, sans-serif;
+        margin: 0;
+        padding: 0;
+        display: flex;
+        flex-direction: column;
+        height: 100vh;
+        background-color: #f5f5f5;
+      }
+
+      .chat-container {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        padding: 20px;
+        overflow-y: auto;
+        max-width: 800px;
+        margin: 20px auto;
+        background-color: white;
+        border-radius: 10px;
+        box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+      }
+
+      .message {
+        margin: 5px;
+        padding: 12px 16px;
+        border-radius: 15px;
+        max-width: 70%;
+        word-wrap: break-word;
+      }
+
+      .user {
+        background-color: #0078d7;
+        color: white;
+        align-self: flex-end;
+      }
+
+      .bot {
+        background-color: #f1f1f1;
+        align-self: flex-start;
+      }
+
+      .input-container {
+        display: flex;
+        padding: 20px;
+        background-color: white;
+        border-top: 1px solid #eee;
+        max-width: 800px;
+        margin: 0 auto 20px auto;
+        border-radius: 10px;
+        box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+      }
+
+      #user-input {
+        flex: 1;
+        padding: 12px;
+        border: 1px solid #ddd;
+        border-radius: 25px;
+        margin-right: 10px;
+        font-size: 14px;
+        outline: none;
+        transition: border-color 0.3s;
+      }
+
+      #user-input:focus {
+        border-color: #0078d7;
+      }
+
+      #send-button {
+        padding: 12px 24px;
+        background-color: #0078d7;
+        color: white;
+        border: none;
+        border-radius: 25px;
+        cursor: pointer;
+        font-weight: bold;
+        transition: background-color 0.3s;
+      }
+
+      #send-button:hover {
+        background-color: #005a9e;
+      }
+
+      .message-time {
+        font-size: 0.7em;
+        margin-top: 5px;
+        opacity: 0.7;
+      }
+
+      .user .message-time {
+        text-align: right;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="chat-container" id="chat-container"></div>
+    <div class="input-container">
+      <input type="text" id="user-input" placeholder="Type a message..." />
+      <button id="send-button">Send</button>
+    </div>
+
+    <script>
+      const chatContainer = document.getElementById('chat-container');
+      const userInput = document.getElementById('user-input');
+      const sendButton = document.getElementById('send-button');
+
+      function formatTime() {
+        const now = new Date();
+        return now.toLocaleTimeString([], {
+          hour: '2-digit',
+          minute: '2-digit',
+        });
+      }
+
+      function appendMessage(text, sender) {
+        const messageDiv = document.createElement('div');
+        messageDiv.classList.add('message', sender);
+
+        const messageText = document.createElement('div');
+        messageText.textContent = text;
+
+        const timeDiv = document.createElement('div');
+        timeDiv.classList.add('message-time');
+        timeDiv.textContent = formatTime();
+
+        messageDiv.appendChild(messageText);
+        messageDiv.appendChild(timeDiv);
+
+        chatContainer.appendChild(messageDiv);
+        chatContainer.scrollTop = chatContainer.scrollHeight;
+      }
+
+      function handleUserMessage() {
+        const text = userInput.value.trim();
+        if (text) {
+          appendMessage(text, 'user');
+          // Simulate bot response (you can replace this with actual bot logic)
+          setTimeout(() => {
+            appendMessage('This is a sample response from the bot.', 'bot');
+          }, 1000);
+          userInput.value = '';
+        }
+      }
+
+      sendButton.addEventListener('click', handleUserMessage);
+
+      userInput.addEventListener('keypress', (e) => {
+        if (e.key === 'Enter') {
+          handleUserMessage();
+        }
+      });
+
+      // Add initial welcome message
+      appendMessage('Hello! How can I help you today?', 'bot');
+    </script>
+  </body>
+</html>
