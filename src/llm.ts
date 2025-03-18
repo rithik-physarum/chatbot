@@ -9,9 +9,9 @@ interface ReadableStream<R = any> {
   getReader(): ReadableStreamDefaultReader<R>;
 }
 
-const API_KEY =
-  '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'; // Replace with your actual API key
-const MODEL = 'google/gemini-2.0-pro-exp-02-05:free';
+export let API_KEY =
+  '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'; // Default OpenRouter API key
+export let MODEL = 'google/gemini-2.0-pro-exp-02-05:free'; // Default model
 
 // Regular non-streaming response
 export async function getGeminiResponse(input: string): Promise<string> {
