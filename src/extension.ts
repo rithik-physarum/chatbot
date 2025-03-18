@@ -2,6 +2,8 @@ import * as vscode from 'vscode';
 import { getGeminiResponse, getGeminiResponseSimulatedStream } from './llm';
 import * as fs from 'fs';
 import * as path from 'path';
+import * as cp from 'child_process';
+import * as os from 'os';
 
 // Simple chat panel class
 class SimpleChatPanel {
@@ -49,65 +51,69 @@ class SimpleChatPanel {
             break;
 
           case 'sendMessage':
-            // Show thinking indicator
-            const messageId = Date.now().toString();
-            this._panel.webview.postMessage({
-              command: 'receiveMessage',
-              text: 'Thinking...',
-              sender: 'bot',
-              isThinking: true,
-              messageId: messageId,
-            });
-
-            try {
-              // Build prompt with file contents if files are selected
-              let prompt = message.text;
-
-              if (message.files && message.files.length > 0) {
-                // Only include tree structure when files are selected
-                prompt = await this._buildPromptWithFiles(
-                  message.text,
-                  message.files
-                );
-              }
-
-              // Use streaming response from Gemini API
-              let fullResponse = '';
-
-              await getGeminiResponseSimulatedStream(
-                prompt, // Send the enhanced prompt with file context
-                (chunk) => {
-                  // Append each chunk from the API
-                  fullResponse += chunk;
-
-                  // Stream each chunk to the webview
-                  this._panel.webview.postMessage({
-                    command: 'updateMessage',
-                    text: fullResponse,
-                    messageId: messageId,
-                    isComplete: false,
-                  });
-                },
-                () => {
-                  // Complete the message when streaming ends
-                  this._panel.webview.postMessage({
-                    command: 'updateMessage',
-                    text: fullResponse,
-                    messageId: messageId,
-                    isComplete: true,
-                  });
-                }
-              );
-            } catch (error) {
-              // Handle API errors
+            // Check if we're in project creation mode
+            if (message.createProject) {
+              await this._handleProjectCreation(message.text);
+            } else {
+              // Existing chat message handling code
+              const messageId = Date.now().toString();
               this._panel.webview.postMessage({
                 command: 'receiveMessage',
-                text: `Error connecting to API: ${
-                  error instanceof Error ? error.message : 'Unknown error'
-                }`,
+                text: 'Thinking...',
                 sender: 'bot',
-                isError: true,
+                isThinking: true,
+                messageId: messageId,
               });
+
+              try {
+                // Build prompt with file contents if files are selected
+                let prompt = message.text;
+
+                if (message.files && message.files.length > 0) {
+                  prompt = await this._buildPromptWithFiles(
+                    message.text,
+                    message.files
+                  );
+                }
+
+                // Use streaming response from Gemini API
+                let fullResponse = '';
+
+                await getGeminiResponseSimulatedStream(
+                  prompt, // Send the enhanced prompt with file context
+                  (chunk) => {
+                    // Append each chunk from the API
+                    fullResponse += chunk;
+
+                    // Stream each chunk to the webview
+                    this._panel.webview.postMessage({
+                      command: 'updateMessage',
+                      text: fullResponse,
+                      messageId: messageId,
+                      isComplete: false,
+                    });
+                  },
+                  () => {
+                    // Complete the message when streaming ends
+                    this._panel.webview.postMessage({
+                      command: 'updateMessage',
+                      text: fullResponse,
+                      messageId: messageId,
+                      isComplete: true,
+                    });
+                  }
+                );
+              } catch (error) {
+                // Handle API errors
+                this._panel.webview.postMessage({
+                  command: 'receiveMessage',
+                  text: `Error connecting to API: ${
+                    error instanceof Error ? error.message : 'Unknown error'
+                  }`,
+                  sender: 'bot',
+                  isError: true,
+                });
+              }
             }
             break;
         }
@@ -327,6 +333,19 @@ class SimpleChatPanel {
                 border-radius: 4px;
                 font-size: 0.9em;
             }
+            /* Add style for the project creation checkbox */
+            .project-checkbox {
+                margin-top: 10px;
+                margin-bottom: 10px;
+                display: flex;
+                align-items: center;
+            }
+            .project-checkbox input {
+                margin-right: 8px;
+            }
+            .project-checkbox label {
+                cursor: pointer;
+            }
         </style>
     </head>
     <body>
@@ -348,6 +367,12 @@ class SimpleChatPanel {
                 <div id="selectedFiles" class="selected-files" style="display: none;">
                     <!-- Selected files will be shown here -->
                 </div>
+            </div>
+            
+            <!-- Project creation checkbox -->
+            <div class="project-checkbox">
+                <input type="checkbox" id="createProjectCheckbox">
+                <label for="createProjectCheckbox">Create Project from GitHub Template</label>
             </div>
             
             <!-- Chat input -->
@@ -397,31 +422,42 @@ class SimpleChatPanel {
             function sendMessage() {
                 const input = document.getElementById('userInput');
                 const message = input.value.trim();
+                const isCreateProject = document.getElementById('createProjectCheckbox').checked;
                 
                 if (message) {
-                    // Include selected files in the display
+                    // Display user message
                     let displayMessage = message;
                     if (selectedFiles.length > 0) {
-                        // Format selected files for display
+                        // Add files context if files are selected
                         let fileList = '';
                         selectedFiles.forEach(file => {
                             fileList += \`- \${file.path}\\n\`;
                         });
-                        displayMessage += \`\\n\\n📄 Selected files:\\n\${fileList}\`;
+                        displayMessage += '\\n\\n📄 Selected files:\\n' + fileList;
                     }
                     
-                    // Display user message
+                    // Add project creation indicator if checkbox is checked
+                    if (isCreateProject) {
+                        displayMessage += '\\n\\n🏗️ Creating project using this prompt';
+                    }
+                    
                     addMessage(displayMessage, 'user');
                     
-                    // Send message to extension with selected files
+                    // Send message to extension with appropriate flags
                     vscode.postMessage({
                         command: 'sendMessage',
                         text: message,
-                        files: selectedFiles.map(f => f.path)
+                        files: selectedFiles.map(f => f.path),
+                        createProject: isCreateProject
                     });
                     
                     // Clear input
                     input.value = '';
+                    
+                    // If project creation, uncheck the box after sending
+                    if (isCreateProject) {
+                        document.getElementById('createProjectCheckbox').checked = false;
+                    }
                 }
             }
             
@@ -897,6 +933,212 @@ class SimpleChatPanel {
     }
 
     return result;
+  }
+
+  private async _handleProjectCreation(prompt: string): Promise<void> {
+    // Create a single message ID for the entire operation
+    const messageId = Date.now().toString();
+    let fullMessage = '';
+
+    try {
+      // Validate workspace
+      const workspaceFolders = vscode.workspace.workspaceFolders;
+      if (!workspaceFolders || workspaceFolders.length === 0) {
+        throw new Error('No workspace folder is open');
+      }
+
+      // Use the first workspace folder as target
+      const targetDir = workspaceFolders[0].uri.fsPath;
+
+      // Show initial message
+      fullMessage = `Creating project from GitHub template based on your prompt: "${prompt}"`;
+      this._panel.webview.postMessage({
+        command: 'receiveMessage',
+        text: fullMessage,
+        sender: 'bot',
+        isThinking: true,
+        messageId: messageId,
+      });
+
+      // Parse the prompt to extract GitHub repo
+      // We'll look for common patterns like "use repo: xyz" or "github.com/xyz"
+      let repoUrl = '';
+
+      // Check for explicit repo mention
+      const repoMatches = prompt.match(
+        /(?:use\s+repo:?\s+|from\s+|github\.com\/|https:\/\/github\.com\/)([a-zA-Z0-9\-]+\/[a-zA-Z0-9\-_.]+)/i
+      );
+
+      if (repoMatches && repoMatches[1]) {
+        repoUrl = `https://github.com/${repoMatches[1].replace(
+          /^(https?:\/\/)?github\.com\//,
+          ''
+        )}`;
+      } else {
+        // Use the prompt as-is if it appears to be a GitHub URL
+        if (prompt.includes('github.com') || prompt.includes('/')) {
+          repoUrl = prompt.trim();
+          if (!repoUrl.startsWith('http')) {
+            repoUrl = `https://github.com/${repoUrl}`;
+          }
+        } else {
+          // If no explicit repo, ask the user
+          repoUrl =
+            (await vscode.window.showInputBox({
+              prompt: 'Enter GitHub repository URL or username/repo',
+              placeHolder:
+                'e.g., username/repository or https://github.com/username/repository',
+            })) || '';
+
+          if (!repoUrl) {
+            // Update message
+            fullMessage += '\n\nProject creation cancelled.';
+            this._panel.webview.postMessage({
+              command: 'updateMessage',
+              text: fullMessage,
+              messageId: messageId,
+              isComplete: true,
+            });
+            return;
+          }
+
+          // Ensure URL format
+          if (!repoUrl.startsWith('http')) {
+            repoUrl = `https://github.com/${repoUrl}`;
+          }
+        }
+      }
+
+      // Update user on progress
+      fullMessage += `\n\nFetching project template from ${repoUrl}...`;
+      this._panel.webview.postMessage({
+        command: 'updateMessage',
+        text: fullMessage,
+        messageId: messageId,
+        isComplete: false,
+      });
+
+      // Create the project
+      await this._createProjectFromTemplate(repoUrl, targetDir);
+
+      // Success message
+      fullMessage += `\n\nProject created successfully at ${targetDir}\nYou can now ask questions about the project files.`;
+      this._panel.webview.postMessage({
+        command: 'updateMessage',
+        text: fullMessage,
+        messageId: messageId,
+        isComplete: true,
+      });
+    } catch (error) {
+      // Error handling
+      console.error('Error creating project:', error);
+      fullMessage += `\n\nError creating project: ${
+        error instanceof Error ? error.message : String(error)
+      }`;
+      this._panel.webview.postMessage({
+        command: 'updateMessage',
+        text: fullMessage,
+        messageId: messageId,
+        isComplete: true,
+      });
+    }
+  }
+
+  private async _createProjectFromTemplate(
+    templateRepo: string,
+    targetFolder: string
+  ): Promise<boolean> {
+    try {
+      // Create temporary directory for the clone
+      const tempDir = path.join(os.tmpdir(), `vscode-template-${Date.now()}`);
+      await fs.promises.mkdir(tempDir, { recursive: true });
+
+      // Method 1: Using git clone (requires git installed)
+      await this._executeCommand(
+        `git clone --depth 1 ${templateRepo} "${tempDir}"`
+      );
+
+      // Remove .git folder to disconnect from source repo
+      const gitFolder = path.join(tempDir, '.git');
+      if (fs.existsSync(gitFolder)) {
+        await this._removeDirectory(gitFolder);
+      }
+
+      // Create project folder (use repo name as folder name)
+      const repoName =
+        templateRepo.split('/').pop()?.replace('.git', '') || 'new-project';
+      const projectFolder = path.join(targetFolder, repoName);
+
+      // Ensure the project folder exists
+      await fs.promises.mkdir(projectFolder, { recursive: true });
+
+      // Copy all files from temp directory to project folder
+      await this._copyFolder(tempDir, projectFolder);
+
+      // Clean up temporary directory
+      await this._removeDirectory(tempDir);
+
+      return true;
+    } catch (error) {
+      console.error('Error creating project from template:', error);
+      throw error;
+    }
+  }
+
+  // Helper method to execute shell commands
+  private _executeCommand(command: string): Promise<string> {
+    return new Promise((resolve, reject) => {
+      cp.exec(command, (error, stdout, stderr) => {
+        if (error) {
+          reject(new Error(`Command failed: ${error.message}\n${stderr}`));
+          return;
+        }
+        resolve(stdout.trim());
+      });
+    });
+  }
+
+  // Helper method to recursively copy a folder
+  private async _copyFolder(source: string, target: string): Promise<void> {
+    // Create target folder if it doesn't exist
+    await fs.promises.mkdir(target, { recursive: true });
+
+    // Read source directory
+    const entries = await fs.promises.readdir(source, { withFileTypes: true });
+
+    for (const entry of entries) {
+      const sourcePath = path.join(source, entry.name);
+      const targetPath = path.join(target, entry.name);
+
+      if (entry.isDirectory()) {
+        // Recursive copy for directories
+        await this._copyFolder(sourcePath, targetPath);
+      } else {
+        // Copy file
+        await fs.promises.copyFile(sourcePath, targetPath);
+      }
+    }
+  }
+
+  // Helper method to recursively remove a directory
+  private async _removeDirectory(dirPath: string): Promise<void> {
+    if (!fs.existsSync(dirPath)) {
+      return;
+    }
+
+    const entries = await fs.promises.readdir(dirPath, { withFileTypes: true });
+
+    for (const entry of entries) {
+      const fullPath = path.join(dirPath, entry.name);
+
+      if (entry.isDirectory()) {
+        await this._removeDirectory(fullPath);
+      } else {
+        await fs.promises.unlink(fullPath);
+      }
+    }
+
+    await fs.promises.rmdir(dirPath);
   }
 }
 
